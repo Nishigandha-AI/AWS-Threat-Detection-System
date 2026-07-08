@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-lambda:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install boto3 pytest --break-system-packages
+
+      - name: Run Lambda unit tests
+        working-directory: lambda
+        env:
+          AWS_DEFAULT_REGION: us-east-1
+        run: pytest -v
+
+  lint-cloudformation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install cfn-lint
+        run: pip install cfn-lint --break-system-packages
+
+      - name: Lint CloudFormation template
+        run: cfn-lint infrastructure/cloudformation/template.yaml

@@ -1,0 +1,265 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Automated AI-Powered AWS Threat Detection System.
+  CloudTrail -> GuardDuty -> EventBridge -> Lambda -> SNS (Email + SMS).
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive security alerts.
+
+  NotificationPhoneNumber:
+    Type: String
+    Default: ""
+    Description: >
+      (Optional) Phone number in E.164 format (e.g. +15551234567) to
+      receive SMS alerts. Leave blank to skip SMS subscription.
+
+  MinSeverity:
+    Type: Number
+    Default: 4.0
+    Description: >
+      Minimum GuardDuty severity score (0.1-8.9) required to trigger an
+      alert. 4.0 = Medium and above, 7.0 = High/Critical only.
+
+  EnableBedrockEnrichment:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Set to "true" to use Amazon Bedrock for AI-generated summaries.
+
+  BedrockModelId:
+    Type: String
+    Default: "anthropic.claude-3-5-sonnet-20241022-v2:0"
+    Description: Bedrock model id used when EnableBedrockEnrichment is true.
+
+  EnableGuardDuty:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Set to "false" if GuardDuty is already enabled in this account/region
+      (GuardDuty can only have one detector per account per region).
+
+Conditions:
+  ShouldEnableGuardDuty: !Equals [!Ref EnableGuardDuty, "true"]
+  HasPhoneNumber: !Not [!Equals [!Ref NotificationPhoneNumber, ""]]
+
+Resources:
+  # ---------------------------------------------------------------------
+  # 1. CloudTrail - records account activity to an S3 bucket.
+  #    GuardDuty consumes CloudTrail management events automatically
+  #    and natively (no direct integration wiring needed), but we still
+  #    provision a dedicated trail so all API activity is durably logged
+  #    for forensics and audit purposes.
+  # ---------------------------------------------------------------------
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "threat-detection-cloudtrail-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldLogs
+            Status: Enabled
+            ExpirationInDays: 365
+
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailBucket.Arn
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${CloudTrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+  ThreatDetectionTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: CloudTrailBucketPolicy
+    Properties:
+      TrailName: threat-detection-trail
+      S3BucketName: !Ref CloudTrailBucket
+      IsLogging: true
+      IsMultiRegionTrail: true
+      IncludeGlobalServiceEvents: true
+      EnableLogFileValidation: true
+
+  # ---------------------------------------------------------------------
+  # 2. GuardDuty - continuously analyzes CloudTrail, VPC Flow Logs, and
+  #    DNS logs for malicious/anomalous activity.
+  # ---------------------------------------------------------------------
+  GuardDutyDetector:
+    Type: AWS::GuardDuty::Detector
+    Condition: ShouldEnableGuardDuty
+    Properties:
+      Enable: true
+      FindingPublishingFrequency: FIFTEEN_MINUTES
+
+  # ---------------------------------------------------------------------
+  # 5. SNS - fans alerts out to Email + SMS subscribers.
+  # ---------------------------------------------------------------------
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: threat-detection-alerts
+      DisplayName: AWS Threat Detection Alerts
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  SmsSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasPhoneNumber
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: sms
+      Endpoint: !Ref NotificationPhoneNumber
+
+  AlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref AlertTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowLambdaPublish
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt ThreatProcessorRole.Arn
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+
+  # ---------------------------------------------------------------------
+  # 4. Lambda - enriches the finding and publishes to SNS.
+  # ---------------------------------------------------------------------
+  ThreatProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: threat-detection-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PublishToAlertTopic
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+        - PolicyName: BedrockInvokeOptional
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/*"
+
+  ThreatProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: guardduty-threat-processor
+      Runtime: python3.12
+      Handler: threat_processor.handler
+      Role: !GetAtt ThreatProcessorRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref AlertTopic
+          MIN_SEVERITY: !Ref MinSeverity
+          USE_BEDROCK: !Ref EnableBedrockEnrichment
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+      Code:
+        # Placeholder inline stub. Replace by deploying the real
+        # lambda/threat_processor.py + enrichment.py via the deploy
+        # script (scripts/deploy.sh), which packages and updates this
+        # function's code after the stack is created.
+        ZipFile: |
+          def handler(event, context):
+              print("Placeholder - deploy real code with scripts/deploy.sh")
+              return {"statusCode": 200, "body": "placeholder"}
+
+  ThreatProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ThreatProcessorFunction}"
+      RetentionInDays: 90
+
+  # ---------------------------------------------------------------------
+  # 3. EventBridge - routes GuardDuty findings to the Lambda function.
+  # ---------------------------------------------------------------------
+  GuardDutyFindingsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: guardduty-findings-to-lambda
+      Description: Routes all GuardDuty findings to the threat processor Lambda.
+      EventPattern:
+        source:
+          - aws.guardduty
+        detail-type:
+          - "GuardDuty Finding"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ThreatProcessorFunction.Arn
+          Id: ThreatProcessorTarget
+
+  EventBridgeInvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ThreatProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt GuardDutyFindingsRule.Arn
+
+Outputs:
+  LambdaFunctionName:
+    Description: Name of the deployed threat-processing Lambda function.
+    Value: !Ref ThreatProcessorFunction
+
+  SnsTopicArn:
+    Description: ARN of the SNS topic used for alert notifications.
+    Value: !Ref AlertTopic
+
+  CloudTrailBucketName:
+    Description: S3 bucket storing CloudTrail logs.
+    Value: !Ref CloudTrailBucket
+
+  EventBridgeRuleName:
+    Description: EventBridge rule routing GuardDuty findings to Lambda.
+    Value: !Ref GuardDutyFindingsRule

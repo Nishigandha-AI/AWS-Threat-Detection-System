@@ -1,0 +1,6 @@
+# boto3 is included in the standard AWS Lambda Python runtime, so it is
+# not strictly required here. Listed for local testing / pinning clarity.
+boto3>=1.34.0
+
+# Test dependencies (not deployed to Lambda)
+pytest>=8.0.0
